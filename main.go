@@ -4,13 +4,15 @@ import (
 	"crypto/md5"
 	"encoding/hex"
 	"fmt"
-	"io"
 	"log"
 	"net/http"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/h2non/bimg"
 )
 
 var (
@@ -65,11 +67,43 @@ func serveAsset(basePath string, w http.ResponseWriter, r *http.Request) {
 	}
 
 	cleanPath := filepath.Clean(rawPath)
-	fullPath := filepath.Join(basePath, cleanPath)
+	originalFullPath := filepath.Join(basePath, cleanPath)
 
-	cacheKey := cache.cacheKey(r, cleanPath)
+	// ───────────────────────────────────────────────
+	// Parse transformation parameters
+	// ───────────────────────────────────────────────
+	q := r.URL.Query()
 
-	// Check cache first
+	width, _ := strconv.Atoi(q.Get("w"))
+	height, _ := strconv.Atoi(q.Get("h"))
+
+	quality := 85
+	if qs := q.Get("q"); qs != "" {
+		if qi, err := strconv.Atoi(qs); err == nil && qi >= 1 && qi <= 100 {
+			quality = qi
+		}
+	}
+
+	// Supported output formats
+	format := "jpeg" // default
+	formatStr := q.Get("format")
+	switch formatStr {
+	case "webp", "avif", "png", "jpeg":
+		format = formatStr
+	}
+
+	// Optional: fit mode (cover, contain, scale-down, etc.)
+	fit := q.Get("fit")
+	if fit == "" {
+		fit = "cover" // most common default for product images
+	}
+
+	// ───────────────────────────────────────────────
+	// Build cache key that includes ALL transformation params
+	// ───────────────────────────────────────────────
+	cacheKey := cache.cacheKeyWithTransform(r, cleanPath, width, height, quality, format, fit)
+
+	// Try cache first
 	if cached, found := cache.Get(cacheKey); found {
 		for k, vv := range cached.Headers {
 			for _, v := range vv {
@@ -82,52 +116,102 @@ func serveAsset(basePath string, w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// File system access
-	file, err := os.Open(fullPath)
+	// ───────────────────────────────────────────────
+	// MISS - process the image
+	// ───────────────────────────────────────────────
+
+	// 1. Read original file
+	originalData, err := bimg.Read(originalFullPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			http.NotFound(w, r)
-			return
+		} else {
+			log.Printf("read original error: %v", err)
+			http.Error(w, "internal error", http.StatusInternalServerError)
 		}
-		log.Printf("open error: %v", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
-		return
-	}
-	defer file.Close()
-
-	stat, err := file.Stat()
-	if err != nil || stat.IsDir() {
-		http.Error(w, "forbidden", http.StatusForbidden)
 		return
 	}
 
-	// Read once
-	body, err := io.ReadAll(file)
+	img := bimg.NewImage(originalData)
+
+	// 2. Prepare processing options
+	options := bimg.Options{
+		Width:         width,
+		Height:        height,
+		Quality:       quality,
+		StripMetadata: true, // remove metadata (EXIF, etc.)
+		NoAutoRotate:  false,
+		Interlace:     true, // progressive JPEG/WebP
+		Gravity:       bimg.GravityCentre,
+	}
+
+	// Fit mode
+	switch fit {
+	case "contain":
+		options.Crop = false
+	case "cover":
+		options.Crop = true
+	case "scale-down":
+		options.Enlarge = false
+	case "crop":
+		options.Crop = true
+	default:
+		options.Crop = true // cover is most common default
+	}
+
+	// Output format
+	switch format {
+	case "webp":
+		options.Type = bimg.WEBP
+	case "avif":
+		options.Type = bimg.AVIF
+	case "png":
+		options.Type = bimg.PNG
+	default:
+		options.Type = bimg.JPEG
+	}
+
+	// 3. Process the image
+	processed, err := img.Process(options)
 	if err != nil {
-		log.Printf("read error: %v", err)
-		http.Error(w, "internal error", http.StatusInternalServerError)
+		log.Printf("image processing error: %v", err)
+		http.Error(w, "cannot process image", http.StatusInternalServerError)
 		return
 	}
 
-	// Generate ETag
-	hash := md5.Sum(body)
+	result := processed
+
+	// 4. Determine correct Content-Type
+	contentType := "image/jpeg"
+	switch format {
+	case "webp":
+		contentType = "image/webp"
+	case "avif":
+		contentType = "image/avif"
+	case "png":
+		contentType = "image/png"
+	}
+
+	// 5. Generate ETag from processed image
+	hash := md5.Sum(result)
 	etag := fmt.Sprintf("\"%s\"", hex.EncodeToString(hash[:]))
 
-	// Set proper headers
-	w.Header().Set("Content-Type", http.DetectContentType(body))
+	// 6. Set response headers
+	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+	w.Header().Set("Vary", "Accept") // important for format negotiation
 	w.Header().Set("X-Cache", "MISS")
 
-	// Conditional request support
+	// Conditional request (If-None-Match)
 	if match := r.Header.Get("If-None-Match"); match == etag {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 
-	// Cache the response
+	// 7. Cache the result
 	entry := CacheEntry{
-		Body:       body,
+		Body:       result,
 		Headers:    w.Header().Clone(),
 		ETag:       etag,
 		StatusCode: http.StatusOK,
@@ -135,6 +219,7 @@ func serveAsset(basePath string, w http.ResponseWriter, r *http.Request) {
 	}
 	cache.Set(cacheKey, entry)
 
+	// 8. Send response
 	w.WriteHeader(http.StatusOK)
-	w.Write(body)
+	w.Write(result)
 }

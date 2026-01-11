@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"net/http"
 	"sort"
+	"strconv"
 	"strings"
 	"time"
 
@@ -74,4 +75,26 @@ func (c *AssetCache) Get(key string) (CacheEntry, bool) {
 
 func (c *AssetCache) Set(key string, entry CacheEntry) {
 	c.lru.Add(key, entry)
+}
+
+func (c *AssetCache) cacheKeyWithTransform(r *http.Request, cleanPath string, w, h, q int, format, fit string) string {
+	var sb strings.Builder
+	sb.WriteString("v2:") // version bump when changing logic
+	sb.WriteString(cleanPath)
+	sb.WriteString("|w=")
+	sb.WriteString(strconv.Itoa(w))
+	sb.WriteString("|h=")
+	sb.WriteString(strconv.Itoa(h))
+	sb.WriteString("|q=")
+	sb.WriteString(strconv.Itoa(q))
+	sb.WriteString("|fmt=")
+	sb.WriteString(format)
+	sb.WriteString("|fit=")
+	sb.WriteString(fit)
+
+	// Optional: include Accept header for future auto-format
+	// sb.WriteString("|accept=" + r.Header.Get("Accept"))
+
+	hash := md5.Sum([]byte(sb.String()))
+	return hex.EncodeToString(hash[:])
 }
