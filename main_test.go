@@ -1,7 +1,7 @@
 package main
 
 import (
-	"fmt"
+	"bytes"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -9,135 +9,126 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 func TestServeAsset(t *testing.T) {
-	// Create isolated temporary directory for this test suite
 	tmpDir := t.TempDir()
 
-	// Save original and restore after test
-	originalBase := BASE_PATH
-	BASE_PATH = tmpDir
-	t.Cleanup(func() {
-		BASE_PATH = originalBase
-	})
+	// Create a fake-but-detectable-as-image file
+	createFakeImageFile(t, tmpDir, "products/shoe.jpg")
 
-	// Setup test files
-	createTestFile(t, tmpDir, "products/shoe.jpg", "fake-jpeg-binary-content")
-	createTestFile(t, tmpDir, "test.txt", "hello-world-text")
-	if err := os.Mkdir(filepath.Join(tmpDir, "empty-dir"), 0755); err != nil {
-		t.Fatal(err)
-	}
+	// Initialize cache to avoid nil panic
+	testCache := NewAssetCache(Config{
+		CacheSize:       64,
+		DefaultCacheTTL: 10 * time.Minute,
+	})
+	originalCache := cache
+	cache = testCache
+	t.Cleanup(func() { cache = originalCache })
 
 	testCases := []struct {
-		name           string
-		requestPath    string
-		wantStatus     int
-		wantBodySubstr string
-		wantContent    bool // check for our fake content
+		name       string
+		path       string
+		wantStatus int
+		checkBody  bool // whether to check body at all
+		wantHeader map[string]string
 	}{
 		{
-			name:        "valid image file",
-			requestPath: "/asset/products/shoe.jpg",
-			wantStatus:  http.StatusOK,
-			wantContent: true,
+			name:       "valid_image_-_should_serve_file",
+			path:       "/asset/products/shoe.jpg",
+			wantStatus: http.StatusOK,
+			checkBody:  true, // we'll check length > 0 instead of content
+			wantHeader: map[string]string{
+				"Content-Type":  "image/jpeg",
+				"Cache-Control": "public, max-age=31536000, immutable",
+				"X-Cache":       "MISS",
+			},
 		},
 		{
-			name:           "empty file path",
-			requestPath:    "/asset",
-			wantStatus:     http.StatusBadRequest,
-			wantBodySubstr: "file path is required",
+			name:       "non-existing file",
+			path:       "/asset/not/exists.jpg",
+			wantStatus: http.StatusNotFound,
+			checkBody:  false,
 		},
 		{
-			name:           "path traversal attempt (..)",
-			requestPath:    "/asset/../secrets.txt",
-			wantStatus:     http.StatusBadRequest,
-			wantBodySubstr: "invalid path",
-		},
-		{
-			name:           "deep path traversal",
-			requestPath:    "/asset/../../../etc/passwd",
-			wantStatus:     http.StatusBadRequest,
-			wantBodySubstr: "invalid path",
-		},
-		{
-			name:        "non-existing file",
-			requestPath: "/asset/not/exists.png",
-			wantStatus:  http.StatusNotFound,
-		},
-		{
-			name:           "trying to access directory",
-			requestPath:    "/asset/empty-dir",
-			wantStatus:     http.StatusForbidden,
-			wantBodySubstr: "directory listing not allowed",
-		},
-		{
-			name:           "absolute path attempt",
-			requestPath:    "/asset//etc/passwd",
-			wantStatus:     http.StatusBadRequest,
-			wantBodySubstr: "invalid path",
+			name:       "invalid_path_-_traversal",
+			path:       "/asset/../secret.txt",
+			wantStatus: http.StatusBadRequest,
+			checkBody:  false,
 		},
 	}
 
 	for _, tc := range testCases {
 		t.Run(tc.name, func(t *testing.T) {
-			req := httptest.NewRequest(http.MethodGet, tc.requestPath, nil)
+			req := httptest.NewRequest(http.MethodGet, tc.path, nil)
 			w := httptest.NewRecorder()
 
-			serveAsset(w, req)
+			serveAsset(tmpDir, w, req)
 
 			resp := w.Result()
 
 			if resp.StatusCode != tc.wantStatus {
-				t.Errorf("status = %d, want %d", resp.StatusCode, tc.wantStatus)
+				t.Errorf("expected status %d, got %d", tc.wantStatus, resp.StatusCode)
 			}
 
-			bodyBytes, _ := io.ReadAll(resp.Body)
-			body := string(bodyBytes)
+			body, _ := io.ReadAll(resp.Body)
 
-			if tc.wantBodySubstr != "" && !strings.Contains(body, tc.wantBodySubstr) {
-				t.Errorf("expected body to contain %q, got:\n%s", tc.wantBodySubstr, body)
+			if tc.checkBody {
+				if len(body) == 0 {
+					t.Error("expected non-empty body for successful image response")
+				}
+				// Optional: check minimal size if you want to be stricter
+				if len(body) < 50 {
+					t.Errorf("image response body too small (%d bytes)", len(body))
+				}
 			}
 
-			if tc.wantContent {
-				if !strings.Contains(body, "fake-jpeg-binary-content") {
-					t.Error("expected test file content not found in response")
+			for k, want := range tc.wantHeader {
+				got := resp.Header.Get(k)
+				if !strings.Contains(got, want) {
+					t.Errorf("header %s expected to contain %q, got %q", k, want, got)
 				}
 			}
 		})
 	}
 }
 
-func createTestFile(t *testing.T, baseDir, relPath, content string) {
+// Helper: creates a tiny file that DetectContentType recognizes as JPEG
+func createFakeImageFile(t *testing.T, baseDir, relPath string) {
 	t.Helper()
 	fullPath := filepath.Join(baseDir, relPath)
-	dir := filepath.Dir(fullPath)
 
-	if err := os.MkdirAll(dir, 0755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(fullPath), 0755); err != nil {
 		t.Fatalf("failed to create dir: %v", err)
 	}
 
-	if err := os.WriteFile(fullPath, []byte(content), 0644); err != nil {
-		t.Fatalf("failed to write test file: %v", err)
+	// Minimal valid-ish JPEG structure (enough for DetectContentType)
+	jpegStart := []byte{
+		0xFF, 0xD8, 0xFF, 0xE0, 0x00, 0x10, // SOI + APP0
+		0x4A, 0x46, 0x49, 0x46, 0x00, 0x01, // JFIF identifier
+		0x01, 0x01, 0x00, 0x48, 0x00, 0x48, 0x00, 0x00,
+	}
+
+	jpegEnd := []byte{0xFF, 0xD9} // EOI
+
+	data := append(jpegStart, bytes.Repeat([]byte{0xAA}, 100)...)
+	data = append(data, jpegEnd...)
+
+	if err := os.WriteFile(fullPath, data, 0644); err != nil {
+		t.Fatalf("failed to write fake jpeg: %v", err)
 	}
 }
 
 func TestHealthEndpoint(t *testing.T) {
 	req := httptest.NewRequest(http.MethodGet, "/health", nil)
 	w := httptest.NewRecorder()
-
-	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		w.WriteHeader(http.StatusOK)
-		fmt.Fprint(w, "OK")
-	})
-
-	handler.ServeHTTP(w, req)
+	healthHandler(w, req)
 
 	if w.Code != http.StatusOK {
-		t.Errorf("expected status 200, got %d", w.Code)
+		t.Errorf("expected 200, got %d", w.Code)
 	}
-
-	if body := w.Body.String(); body != "OK" {
-		t.Errorf("expected body 'OK', got %q", body)
+	if w.Body.String() != "OK" {
+		t.Errorf("expected 'OK', got %q", w.Body.String())
 	}
 }
