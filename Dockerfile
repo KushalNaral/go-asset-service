@@ -1,45 +1,43 @@
-# Build stage
-FROM golang:1.23-bookworm AS builder
+FROM golang:1.25-alpine AS builder
 
-# Install libvips + build tools in one layer
-RUN apt-get update -qq && \
-    apt-get install -y --no-install-recommends \
-        libvips-dev \
-        pkg-config \
-    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+RUN apk add --no-cache \
+    build-base \
+    vips-dev \
+    pkgconf
 
 WORKDIR /app
-
-# Cache dependencies
 COPY go.mod go.sum ./
 RUN go mod download
-
-# Copy source and build
 COPY . .
-RUN CGO_ENABLED=1 GOOS=linux go build -o /asset-service ./main.go
 
-# Final runtime image (small)
-FROM debian:bookworm-slim
+# You can keep CGO_ENABLED=1 here if needed
+RUN CGO_ENABLED=1 GOOS=linux go build \
+    -trimpath \
+    -ldflags="-s -w" \
+    -o /asset-service \
+    .
 
-# Install only runtime libvips (much smaller)
-RUN apt-get update -qq && \
-    apt-get install -y --no-install-recommends \
-        libvips42 \
-        ca-certificates \
-    && rm -rf /var/lib/apt/lists/* /var/cache/apt/archives/*
+# ───────────────────────────────────────────────────────────────
+#  Runtime stage
+# ───────────────────────────────────────────────────────────────
+FROM alpine:3.23
 
-# Run as non-root user (good practice)
-RUN useradd -m appuser
-USER appuser
+RUN apk add --no-cache \
+    ca-certificates \
+    vips \
+    tzdata
+
+# Non-root user
+RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 
 WORKDIR /app
 
-# Copy only the compiled binary
-COPY --from=builder /asset-service /app/asset-service
+COPY --from=builder /asset-service .
+RUN chown -R appuser:appgroup /app
 
-# Where your images live (you'll mount this volume)
+USER appuser
+
 VOLUME ["/storage"]
-
 EXPOSE 8080
 
 CMD ["/app/asset-service"]
