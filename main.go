@@ -69,7 +69,6 @@ func rootHandler(w http.ResponseWriter, r *http.Request) {
 func serveAsset(basePath string, w http.ResponseWriter, r *http.Request) {
 	rawPath := strings.TrimPrefix(r.URL.Path, "/asset")
 	rawPath = strings.TrimPrefix(rawPath, "/")
-
 	if rawPath == "" {
 		http.Error(w, "file path required", http.StatusBadRequest)
 		return
@@ -84,9 +83,96 @@ func serveAsset(basePath string, w http.ResponseWriter, r *http.Request) {
 	originalFullPath := filepath.Join(basePath, cleanPath)
 
 	// ───────────────────────────────────────────────
-	// Parse transformation parameters
+	// Determine file extension
+	// ───────────────────────────────────────────────
+	ext := strings.ToLower(filepath.Ext(cleanPath))
+
+	// Supported image extensions (expand as needed for your libvips)
+	supportedImageExts := map[string]bool{
+		".jpg":  true,
+		".jpeg": true,
+		".png":  true,
+		".webp": true,
+		".avif": true,
+		".heic": true,
+		".heif": true,
+		".tiff": true,
+		".tif":  true,
+		".gif":  true,
+	}
+
+	// ───────────────────────────────────────────────
+	// Parse query params once
 	// ───────────────────────────────────────────────
 	q := r.URL.Query()
+
+	// Check if ANY transformation is requested
+	hasTransform := false
+	if q.Has("w") || q.Has("h") || q.Has("q") || q.Has("format") || q.Has("fit") {
+		hasTransform = true
+	}
+
+	// ───────────────────────────────────────────────
+	// DEFAULT BEHAVIOR: serve original file directly
+	// (no params OR non-image file)
+	// ───────────────────────────────────────────────
+	if !hasTransform || !supportedImageExts[ext] {
+		data, err := os.ReadFile(originalFullPath)
+		if err != nil {
+			if os.IsNotExist(err) {
+				http.NotFound(w, r)
+			} else {
+				log.Printf("cannot read original file %s: %v", originalFullPath, err)
+				http.Error(w, "internal error", http.StatusInternalServerError)
+			}
+			return
+		}
+
+		// Determine content type
+		contentType := http.DetectContentType(data)
+		// Improve for common video types
+		if contentType == "application/octet-stream" {
+			switch ext {
+			case ".mp4":
+				contentType = "video/mp4"
+			case ".webm":
+				contentType = "video/webm"
+			case ".mov":
+				contentType = "video/quicktime"
+			case ".m4v":
+				contentType = "video/x-m4v"
+			case ".avi":
+				contentType = "video/x-msvideo"
+			case ".mkv":
+				contentType = "video/x-matroska"
+			}
+		}
+
+		// Headers for originals
+		w.Header().Set("Content-Type", contentType)
+		w.Header().Set("Content-Length", strconv.Itoa(len(data)))
+		w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+		w.Header().Set("Accept-Ranges", "bytes") // good for video seeking
+
+		// ETag for conditional requests
+		hash := md5.Sum(data)
+		etag := fmt.Sprintf("\"%s\"", hex.EncodeToString(hash[:]))
+		w.Header().Set("ETag", etag)
+
+		if match := r.Header.Get("If-None-Match"); match == etag {
+			w.WriteHeader(http.StatusNotModified)
+			return
+		}
+
+		w.Header().Set("X-Cache", "BYPASS")
+		w.WriteHeader(http.StatusOK)
+		w.Write(data)
+		return
+	}
+
+	// ───────────────────────────────────────────────
+	// Only reach here if: it's an image AND transformation requested
+	// ───────────────────────────────────────────────
 
 	width, _ := strconv.Atoi(q.Get("w"))
 	height, _ := strconv.Atoi(q.Get("h"))
@@ -98,26 +184,22 @@ func serveAsset(basePath string, w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	// Supported output formats
-	format := "jpeg" // default
+	format := "jpeg"
 	formatStr := q.Get("format")
 	switch formatStr {
 	case "webp", "avif", "png", "jpeg":
 		format = formatStr
 	}
 
-	// Optional: fit mode (cover, contain, scale-down, etc.)
 	fit := q.Get("fit")
 	if fit == "" {
-		fit = "cover" // most common default for product images
+		fit = "cover"
 	}
 
-	// ───────────────────────────────────────────────
-	// Build cache key that includes ALL transformation params
-	// ───────────────────────────────────────────────
+	// Build cache key **only** when transforming
 	cacheKey := cache.cacheKeyWithTransform(r, cleanPath, width, height, quality, format, fit)
 
-	// Try cache first
+	// Try cache
 	if cached, found := cache.Get(cacheKey); found {
 		for k, vv := range cached.Headers {
 			for _, v := range vv {
@@ -131,16 +213,14 @@ func serveAsset(basePath string, w http.ResponseWriter, r *http.Request) {
 	}
 
 	// ───────────────────────────────────────────────
-	// MISS - process the image
+	// Process image
 	// ───────────────────────────────────────────────
-
-	// 1. Read original file
 	originalData, err := bimg.Read(originalFullPath)
 	if err != nil {
 		if os.IsNotExist(err) {
 			http.NotFound(w, r)
 		} else {
-			log.Printf("read original error: %v", err)
+			log.Printf("read original error: %v path=%s", err, originalFullPath)
 			http.Error(w, "internal error", http.StatusInternalServerError)
 		}
 		return
@@ -148,32 +228,27 @@ func serveAsset(basePath string, w http.ResponseWriter, r *http.Request) {
 
 	img := bimg.NewImage(originalData)
 
-	// 2. Prepare processing options
 	options := bimg.Options{
 		Width:         width,
 		Height:        height,
 		Quality:       quality,
-		StripMetadata: true, // remove metadata (EXIF, etc.)
+		StripMetadata: true,
 		NoAutoRotate:  false,
-		Interlace:     true, // progressive JPEG/WebP
+		Interlace:     true,
 		Gravity:       bimg.GravityCentre,
 	}
 
-	// Fit mode
 	switch fit {
 	case "contain":
 		options.Crop = false
-	case "cover":
+	case "cover", "crop":
 		options.Crop = true
 	case "scale-down":
 		options.Enlarge = false
-	case "crop":
-		options.Crop = true
 	default:
-		options.Crop = true // cover is most common default
+		options.Crop = true
 	}
 
-	// Output format
 	switch format {
 	case "webp":
 		options.Type = bimg.WEBP
@@ -185,17 +260,15 @@ func serveAsset(basePath string, w http.ResponseWriter, r *http.Request) {
 		options.Type = bimg.JPEG
 	}
 
-	// 3. Process the image
 	processed, err := img.Process(options)
 	if err != nil {
-		log.Printf("image processing error: %v", err)
+		log.Printf("image processing error: %v path=%s options=%+v", err, cleanPath, options)
 		http.Error(w, "cannot process image", http.StatusInternalServerError)
 		return
 	}
 
 	result := processed
 
-	// 4. Determine correct Content-Type
 	contentType := "image/jpeg"
 	switch format {
 	case "webp":
@@ -206,24 +279,21 @@ func serveAsset(basePath string, w http.ResponseWriter, r *http.Request) {
 		contentType = "image/png"
 	}
 
-	// 5. Generate ETag from processed image
 	hash := md5.Sum(result)
 	etag := fmt.Sprintf("\"%s\"", hex.EncodeToString(hash[:]))
 
-	// 6. Set response headers
 	w.Header().Set("Content-Type", contentType)
 	w.Header().Set("ETag", etag)
 	w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
-	w.Header().Set("Vary", "Accept") // important for format negotiation
+	w.Header().Set("Vary", "Accept")
 	w.Header().Set("X-Cache", "MISS")
 
-	// Conditional request (If-None-Match)
 	if match := r.Header.Get("If-None-Match"); match == etag {
 		w.WriteHeader(http.StatusNotModified)
 		return
 	}
 
-	// 7. Cache the result
+	// Cache it
 	entry := CacheEntry{
 		Body:       result,
 		Headers:    w.Header().Clone(),
@@ -233,7 +303,6 @@ func serveAsset(basePath string, w http.ResponseWriter, r *http.Request) {
 	}
 	cache.Set(cacheKey, entry)
 
-	// 8. Send response
 	w.WriteHeader(http.StatusOK)
 	w.Write(result)
 }
