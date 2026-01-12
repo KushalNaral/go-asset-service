@@ -34,6 +34,20 @@ func main() {
 	mux.HandleFunc("GET /asset/", func(w http.ResponseWriter, r *http.Request) {
 		serveAsset(config.BasePath, w, r)
 	})
+	mux.HandleFunc("GET /admin/clear-cache", func(w http.ResponseWriter, r *http.Request) {
+		secret := r.URL.Query().Get("secret")
+		if secret != config.ClearKey {
+			http.Error(w, "Unauthorized", http.StatusUnauthorized)
+			return
+		}
+
+		before := cache.lru.Len()
+		cache.lru.Purge()
+		after := cache.lru.Len()
+
+		w.Header().Set("Content-Type", "text/plain")
+		fmt.Fprintf(w, "Cache cleared successfully\nBefore: %d entries\nAfter: %d entries\n", before, after)
+	})
 	mux.HandleFunc("GET /", rootHandler)
 
 	log.Fatal(http.ListenAndServe(config.Port, mux))

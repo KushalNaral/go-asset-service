@@ -12,6 +12,7 @@ type Config struct {
 	Port            string
 	BasePath        string
 	CacheSize       int
+	ClearKey        string
 	DefaultCacheTTL time.Duration
 }
 
@@ -34,12 +35,14 @@ func LoadConfig() Config {
 	}
 
 	port := getEnv("PORT", ":8080")
+	clearKey := getEnv("CLEAR_KEY", "secret123")
 	basePath := getEnv("BASE_PATH", "/home/rome/work/ecom/api/storage/app/public")
 
 	return Config{
 		Port:            port,
 		BasePath:        basePath,
 		CacheSize:       cacheSize,
+		ClearKey:        clearKey,
 		DefaultCacheTTL: ttl,
 	}
 }
