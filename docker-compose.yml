@@ -1,23 +1,30 @@
-version: "3.8"
-
 services:
   asset-service:
+    build: .
     image: asset-service:latest
     container_name: asset-service
     restart: unless-stopped
+    # Host nginx proxies /storage here; only reachable from the server itself.
     ports:
-      - "8087:8080"
-    volumes:
-      # - /var/lib/jenkins/workspace/ecommerce-api/public:/storage:ro
-      - /home/rome/work/ecom/api/storage/app/public:/storage:ro
+      - "127.0.0.1:8087:8080"
+    # Same network as the API stack, so the origin is the API's nginx container
+    # and Laravel reaches the admin API at http://asset-service:8080.
+    networks:
+      - ecommerce_network
+    env_file:
+      - .env
     environment:
-      - BASE_PATH=/storage
       - PORT=:8080
-      # - CACHE_SIZE=1024
-      # - CACHE_TTL=24h
+      - ORIGIN_URL=${ORIGIN_URL:-http://ecommerce_nginx/storage}
+      - STATS_FILE=/data/stats.json
+    volumes:
+      - asset-data:/data
     read_only: true
-    healthcheck:
-      test: ["CMD", "wget", "--spider", "-q", "http://localhost:8080/"]
-      interval: 30s
-      timeout: 10s
-      retries: 3
+    mem_limit: 1g
+
+volumes:
+  asset-data:
+
+networks:
+  ecommerce_network:
+    external: true

@@ -33,11 +33,14 @@ RUN addgroup -S appgroup && adduser -S appuser -G appgroup
 WORKDIR /app
 
 COPY --from=builder /asset-service .
-RUN chown -R appuser:appgroup /app
+# /data holds stats.json (STATS_FILE) so hit counts survive restarts
+RUN mkdir -p /data && chown -R appuser:appgroup /app /data
 
 USER appuser
 
-VOLUME ["/storage"]
+VOLUME ["/data"]
 EXPOSE 8080
+
+HEALTHCHECK --interval=30s --timeout=5s --retries=3 CMD wget -q --spider http://127.0.0.1:8080/health || exit 1
 
 CMD ["/app/asset-service"]
